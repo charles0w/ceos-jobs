@@ -39,7 +39,9 @@ The `id` must be exactly `'jobs'` — it is the key used by both the heartbeat (
 
 Create **`ceos-enterprise/lib/jobs.ts`**, mirroring `lib/growth.ts` exactly in style — a typed interface, one aggregate `sql` query over the shared `job_applications` table, `Number(...)` coercion on every count, and a `try/catch` that returns `null` so a missing table never breaks the fleet view.
 
-The `job_applications` schema follows the pipeline state machine from the research (Discovered → … → Submitted → Interviewing → Offer). The aggregate surfaces the funnel counts that matter on a dashboard tile: total discovered, tailored, submitted, interviews, offers, and last activity.
+> The canonical schema lives in **`ceos-jobs/db/schema.sql`**, and `lib/jobs.ts` must stay in lockstep with its `stage` enum — if the enum or column names change there, this query changes too.
+
+The `job_applications` schema follows the pipeline state machine from `db/schema.sql` (`discovered → … → submitted → assessment/interview → offer`). The aggregate surfaces the funnel counts that matter on a dashboard tile: total discovered, tailored, submitted, interviews, offers, and last activity.
 
 ```ts
 import { sql } from '@vercel/postgres';
@@ -57,12 +59,12 @@ export async function getJobStats(): Promise<JobStats | null> {
   try {
     const { rows } = await sql`
       SELECT
-        COUNT(*)                                                          AS discovered,
-        COUNT(*) FILTER (WHERE tailored_at IS NOT NULL)                   AS tailored,
-        COUNT(*) FILTER (WHERE status IN ('submitted', 'oa', 'interviewing', 'offer', 'closed')) AS submitted,
-        COUNT(*) FILTER (WHERE status IN ('oa', 'interviewing'))          AS interviews,
-        COUNT(*) FILTER (WHERE status = 'offer')                          AS offers,
-        MAX(status_updated_at)                                            AS last_activity_at
+        COUNT(*)                                                      AS discovered,
+        COUNT(*) FILTER (WHERE resume_variant_url IS NOT NULL)        AS tailored,
+        COUNT(*) FILTER (WHERE submitted_at IS NOT NULL)              AS submitted,
+        COUNT(*) FILTER (WHERE stage IN ('assessment', 'interview'))  AS interviews,
+        COUNT(*) FILTER (WHERE stage = 'offer')                       AS offers,
+        MAX(last_status_at)                                           AS last_activity_at
       FROM job_applications
     `;
     const r = rows[0];
@@ -82,10 +84,10 @@ export async function getJobStats(): Promise<JobStats | null> {
 
 Notes on the schema this query assumes (owned and migrated by `ceos-jobs`, see STEP 4):
 
-- `status` is the forward-only state machine: `discovered | queued | tailoring | ready | submitted | oa | interviewing | offer | closed`. `submitted` is counted as "any application that reached or passed the submit gate," which is why it includes the later states — the funnel never decreases as a row advances.
-- `interviews` counts rows currently in an assessment/interview state (`oa`, `interviewing`); `offers` counts terminal `offer`.
-- `tailored_at` is a nullable timestamp set when the LLM tailoring pass + human diff approval completes (the Tailoring→Ready gate).
-- `status_updated_at` is bumped on every state transition and powers `lastActivityAt`, the analogue of Growth's `lastScrapedAt`.
+- The pipeline column is `stage` (not `status`): `discovered | queued | tailoring | ready | submitted | assessment | interview | offer | rejected | ghosted`. `submitted` on the tile is counted off `submitted_at IS NOT NULL` — i.e. any application that reached or passed the submit gate, independent of its current `stage`.
+- `interviews` counts rows currently in an assessment/interview stage (`assessment`, `interview`); `offers` counts terminal `offer`. The other terminal stages are `rejected` and `ghosted`.
+- There is no `tailored_at` column — "tailored" is derived from `resume_variant_url` being set (a tailored resume artifact actually exists), produced when the LLM tailoring pass + human diff approval completes (the Tailoring→Ready gate).
+- `last_status_at` is bumped on every stage transition and powers `lastActivityAt`, the analogue of Growth's `lastScrapedAt`.
 
 ---
 
@@ -176,53 +178,61 @@ await reportStatus({
 
 The `agentId` is `'jobs'` and the `status` body must match the `AgentStatus` interface (`state: 'ok' | 'warn' | 'error'`, ISO `lastRun`, `summary`, `ok`). `/api/report` validates the `x-report-secret` header against `REPORT_SECRET` and calls `registry.upsertStatus('jobs', status)`, which writes `agent_status` (KV fallback `agent:status:jobs`).
 
-**(b) Write pipeline rows into the shared `job_applications` table.** Because Jobs uses the rich-stats pattern, it owns this table and writes directly to the same Postgres database `ceos-enterprise` reads from. Connect with the same `@vercel/postgres` `sql` helper using the `POSTGRES_URL` env (Vercel auto-injects `POSTGRES_URL` for the linked Neon database; use the pooled connection string). Create the table once on startup, mirroring how `registry.ts` does `CREATE TABLE IF NOT EXISTS`:
+**(b) Write pipeline rows into the shared `job_applications` table.** Because Jobs uses the rich-stats pattern, it owns this table and writes directly to the same Postgres database `ceos-enterprise` reads from. Connect with the same `@vercel/postgres` `sql` helper using the `POSTGRES_URL` env (Vercel auto-injects `POSTGRES_URL` for the linked Neon database; use the pooled connection string). The canonical DDL is `ceos-jobs/db/schema.sql`; the snippet below mirrors that shape (a representative subset of columns — every column named here exists in `db/schema.sql`), created with `CREATE TABLE IF NOT EXISTS` the same way `registry.ts` does:
 
 ```ts
-// ceos-jobs — run once at startup / in a migration
+// ceos-jobs — run once at startup / in a migration (see db/schema.sql for the full DDL)
 import { sql } from '@vercel/postgres';
 
 export async function ensureJobTable(): Promise<void> {
   await sql`
     CREATE TABLE IF NOT EXISTS job_applications (
-      id                 TEXT PRIMARY KEY,
-      company            TEXT NOT NULL,
-      title              TEXT NOT NULL,
-      location           TEXT,
-      source             TEXT,                 -- simplify | vanshb03 | greenhouse | lever | ashby | jsearch | adzuna
-      ats_type           TEXT,                 -- greenhouse | lever | ashby | workday | other
-      apply_url          TEXT,
-      status             TEXT NOT NULL DEFAULT 'discovered',
-      resume_version     TEXT,
-      tailored_at        TIMESTAMPTZ,
-      status_updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-      created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+      id                  UUID PRIMARY KEY,
+      listing_id          UUID,
+      company             TEXT,
+      title               TEXT,
+      stage               TEXT NOT NULL DEFAULT 'discovered'
+        CHECK (stage IN ('discovered','queued','tailoring','ready','submitted','assessment','interview','offer','rejected','ghosted')),
+      resume_variant_url  TEXT,
+      cover_letter_url    TEXT,
+      source              TEXT,
+      submitted_at        TIMESTAMPTZ,
+      last_status_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      notes               TEXT,
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `;
 }
 ```
 
-Upsert a row whenever a listing is discovered or advances a stage. Use the normalized canonical-apply-URL hash as `id` so the same posting from two sources (e.g. a SimplifyJobs feed row and a direct Greenhouse poll) dedupes to one row:
+Upsert a row whenever a listing is discovered or advances a stage. Bump `last_status_at = now()` on every transition so `lastActivityAt` stays current:
 
 ```ts
 await sql`
-  INSERT INTO job_applications (id, company, title, location, source, ats_type, apply_url, status, status_updated_at)
-  VALUES (${id}, ${company}, ${title}, ${location}, ${source}, ${atsType}, ${applyUrl}, ${status}, now())
+  INSERT INTO job_applications (id, listing_id, company, title, source, stage, last_status_at)
+  VALUES (${id}, ${listingId}, ${company}, ${title}, ${source}, ${stage}, now())
   ON CONFLICT (id) DO UPDATE SET
-    status = EXCLUDED.status,
-    status_updated_at = now()
+    stage = EXCLUDED.stage,
+    last_status_at = now(),
+    updated_at = now()
 `;
 ```
 
-When a tailoring pass is approved, set `tailored_at` and bump `status`:
+When a tailoring pass is approved, store the tailored artifact in `resume_variant_url` and advance the pipeline to `ready`, bumping `last_status_at`:
 
 ```ts
 await sql`
   UPDATE job_applications
-  SET tailored_at = now(), resume_version = ${resumeVersion}, status = 'ready', status_updated_at = now()
+  SET resume_variant_url = ${resumeVariantUrl},
+      stage = 'ready',
+      last_status_at = now(),
+      updated_at = now()
   WHERE id = ${id}
 `;
 ```
+
+On submission, set `submitted_at` and advance `stage` to `submitted` (and likewise bump to `assessment` / `interview` / `offer` / `rejected` / `ghosted` as the application progresses, always with `last_status_at = now()`).
 
 ### Required environment
 
