@@ -20,6 +20,14 @@
  *   tsx scripts/report-status.ts ok "42 discovered · 9 submitted · 2 interviews"
  *   tsx scripts/report-status.ts warn "JSearch quota exhausted; ATS polling only"
  *   tsx scripts/report-status.ts error "Greenhouse poll failed: 5 boards timed out"
+ *   tsx scripts/report-status.ts ok "tailoring batch" --progress 0.4 \
+ *     --metrics '[{"label":"Tailored","value":6}]'
+ *
+ * --metrics: up to 3 {"label","value","unit"?,"money"?,"signed"?} card numbers.
+ *   Omit them for routine heartbeats — the dashboard falls back to richer
+ *   aggregates from job_applications (lib/jobs.ts) when no metrics are reported.
+ * --progress: 0..1 through the current task (drives the card's progress bar).
+ * (No profit reporting here on purpose: jobs realizes no revenue.)
  *
  * Env:
  *   REPORT_SECRET (required) — shared secret sent as the 'x-report-secret' header.
@@ -31,11 +39,21 @@
 
 // Inline copy of the AgentStatus shape from ceos-enterprise/lib/types.ts.
 // Keep this in sync with the dashboard's definition.
+type AgentMetric = {
+  label: string;
+  value: number;
+  unit?: string;
+  money?: boolean;
+  signed?: boolean;
+};
+
 type AgentStatus = {
   state: 'ok' | 'warn' | 'error';
   lastRun: string; // ISO-8601, computed at runtime
   summary: string;
   ok: boolean;
+  metrics?: AgentMetric[]; // up to 3 card numbers (dashboard caps at 3)
+  progress?: number; // 0..1 through the current task
 };
 
 const AGENT_ID = 'jobs';
@@ -48,7 +66,8 @@ const DEFAULT_SUMMARY = 'Jobs agent run complete — pipeline synced to fleet.';
  */
 async function reportStatus(
   state: AgentStatus['state'] = 'ok',
-  summary: string = DEFAULT_SUMMARY
+  summary: string = DEFAULT_SUMMARY,
+  opts: { metrics?: AgentMetric[]; progress?: number } = {}
 ): Promise<void> {
   const reportSecret = process.env.REPORT_SECRET;
   if (!reportSecret) {
@@ -68,6 +87,12 @@ async function reportStatus(
     // only a hard 'error' marks the agent as not ok.
     ok: state !== 'error',
   };
+  if (opts.metrics?.length) {
+    status.metrics = opts.metrics.slice(0, 3);
+  }
+  if (opts.progress != null && Number.isFinite(opts.progress)) {
+    status.progress = Math.max(0, Math.min(1, opts.progress));
+  }
 
   const res = await fetch(endpoint, {
     method: 'POST',
@@ -95,29 +120,51 @@ async function reportStatus(
 }
 
 /**
- * Parse simple positional CLI args: [state] [summary...]
- * - argv[0] (optional): one of 'ok' | 'warn' | 'error'. Defaults to 'ok'.
- * - argv[1..] (optional): the summary string (remaining args are joined with spaces).
+ * Parse CLI args: [state] [summary...] [--progress <0..1>] [--metrics '<json>']
+ * - state (optional): one of 'ok' | 'warn' | 'error'. Defaults to 'ok'.
+ * - summary (optional): remaining positional args, joined with spaces.
+ * - --progress (optional): 0..1 through the current task.
+ * - --metrics (optional): JSON array of up to 3 card metrics.
  */
 function parseArgs(argv: string[]): {
   state: AgentStatus['state'];
   summary: string;
+  metrics?: AgentMetric[];
+  progress?: number;
 } {
-  let state: AgentStatus['state'] = 'ok';
-  let rest = argv;
+  const positional: string[] = [];
+  let metrics: AgentMetric[] | undefined;
+  let progress: number | undefined;
 
-  if (argv.length > 0 && ['ok', 'warn', 'error'].includes(argv[0])) {
-    state = argv[0] as AgentStatus['state'];
-    rest = argv.slice(1);
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--progress' && argv[i + 1] != null) {
+      progress = Number(argv[++i]);
+    } else if (argv[i] === '--metrics' && argv[i + 1] != null) {
+      try {
+        const parsed = JSON.parse(argv[++i]);
+        if (Array.isArray(parsed)) metrics = parsed as AgentMetric[];
+      } catch {
+        console.error('[report-status] --metrics is not valid JSON; ignoring');
+      }
+    } else {
+      positional.push(argv[i]);
+    }
+  }
+
+  let state: AgentStatus['state'] = 'ok';
+  let rest = positional;
+  if (positional.length > 0 && ['ok', 'warn', 'error'].includes(positional[0])) {
+    state = positional[0] as AgentStatus['state'];
+    rest = positional.slice(1);
   }
 
   const summary = rest.length > 0 ? rest.join(' ') : DEFAULT_SUMMARY;
-  return { state, summary };
+  return { state, summary, metrics, progress };
 }
 
 async function main(): Promise<void> {
-  const { state, summary } = parseArgs(process.argv.slice(2));
-  await reportStatus(state, summary);
+  const { state, summary, metrics, progress } = parseArgs(process.argv.slice(2));
+  await reportStatus(state, summary, { metrics, progress });
 }
 
 main().catch((err: unknown) => {
@@ -126,4 +173,4 @@ main().catch((err: unknown) => {
   process.exit(1);
 });
 
-export { reportStatus, type AgentStatus };
+export { reportStatus, type AgentStatus, type AgentMetric };
